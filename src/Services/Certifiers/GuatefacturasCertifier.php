@@ -54,6 +54,9 @@ class GuatefacturasCertifier implements CertifierInterface
                 'fel_serie' => $parsed['serie'] ?? null,
                 'fel_preimpreso' => $parsed['preimpreso'] ?? null,
                 'fel_uuid' => $parsed['uuid'] ?? null,
+                'metadata' => array_merge($document->metadata ?: [], [
+                    'certifier_response' => $this->certifierResponseMetadata($parsed),
+                ]),
                 'response_body' => $responseBody,
                 'status' => FelDocument::STATUS_CERTIFIED,
                 'certified_at' => Carbon::now(config('fel.timezone', 'America/Guatemala')),
@@ -275,21 +278,43 @@ XML;
                 'serie' => (string) ($xml->Serie ?? ''),
                 'preimpreso' => (string) ($xml->Preimpreso ?? ''),
                 'uuid' => (string) ($xml->NumeroAutorizacion ?? ''),
+                'nombre' => (string) ($xml->Nombre ?? ''),
+                'direccion' => (string) ($xml->Direccion ?? ''),
+                'telefono' => (string) ($xml->Telefono ?? ''),
+                'referencia' => (string) ($xml->Referencia ?? ''),
             ];
         }
 
         if (preg_match('/NumeroAutorizacion>\s*([^<]+)\s*</', $decodedResult, $uuidMatches) === 1) {
             preg_match('/Serie>\s*([^<]+)\s*</', $decodedResult, $serieMatches);
             preg_match('/Preimpreso>\s*([^<]+)\s*</', $decodedResult, $preimpresoMatches);
+            preg_match('/Nombre>\s*([^<]*)\s*</', $decodedResult, $nombreMatches);
+            preg_match('/Direccion>\s*([^<]*)\s*</', $decodedResult, $direccionMatches);
+            preg_match('/Telefono>\s*([^<]*)\s*</', $decodedResult, $telefonoMatches);
+            preg_match('/Referencia>\s*([^<]*)\s*</', $decodedResult, $referenciaMatches);
 
             return [
                 'serie' => $serieMatches[1] ?? '',
                 'preimpreso' => $preimpresoMatches[1] ?? '',
                 'uuid' => $uuidMatches[1],
+                'nombre' => $nombreMatches[1] ?? '',
+                'direccion' => $direccionMatches[1] ?? '',
+                'telefono' => $telefonoMatches[1] ?? '',
+                'referencia' => $referenciaMatches[1] ?? '',
             ];
         }
 
         return ['error' => $decodedResult];
+    }
+
+    private function certifierResponseMetadata(array $parsed): array
+    {
+        return array_filter([
+            'nombre' => $parsed['nombre'] ?? null,
+            'direccion' => $parsed['direccion'] ?? null,
+            'telefono' => $parsed['telefono'] ?? null,
+            'referencia' => $parsed['referencia'] ?? null,
+        ], fn ($value) => $value !== null && $value !== '');
     }
 
     private function parseAnnulSoapResponse(string $soapResponse): array
