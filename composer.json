@@ -1,6 +1,14 @@
 {
     "name": "l2ernestoo/facturalesgt",
-    "description": "Reusable Laravel package for Guatemalan FEL certification.",
+    "description": "Laravel package for Guatemalan FEL certification with Ainnova / Guatefacturas.",
+    "keywords": [
+        "fel",
+        "guatemala",
+        "factura-electronica",
+        "ainnova",
+        "guatefacturas",
+        "laravel"
+    ],
     "type": "library",
     "license": "MIT",
     "autoload": {
