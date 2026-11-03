@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Log;
 use Lc\Fel\Contracts\CertifierInterface;
 use Lc\Fel\Contracts\FelConfigRepositoryInterface;
 use Lc\Fel\Data\FelDocumentData;
+use Lc\Fel\Exceptions\CertifierTimeoutException;
 use Lc\Fel\Models\FelDocument;
 use Lc\Fel\Services\DocumentBuilderFactory;
 
@@ -23,6 +24,7 @@ class GuatefacturasCertifier implements CertifierInterface
     {
         $xml = null;
         $soapRequest = null;
+        $redactedSoapRequest = null;
 
         try {
             $builder = $this->builders->make($data->documentType);
@@ -35,11 +37,13 @@ class GuatefacturasCertifier implements CertifierInterface
                 $config['machine_id'] ?? '1',
                 $config
             );
+            // Lo que se guarda o se devuelve nunca lleva el password FEL.
+            $redactedSoapRequest = self::redactCredentials($soapRequest);
 
             $document->update([
                 'status' => FelDocument::STATUS_PENDING,
                 'request_xml' => $xml,
-                'soap_request' => $soapRequest,
+                'soap_request' => $redactedSoapRequest,
                 'error_message' => null,
             ]);
 
@@ -68,34 +72,54 @@ class GuatefacturasCertifier implements CertifierInterface
                 'data' => array_merge($parsed, [
                     'request_xml' => $xml,
                     'raw_response' => $responseBody,
-                    'soap_request' => $soapRequest,
+                    'soap_request' => $redactedSoapRequest,
                 ]),
             ];
         } catch (Exception $e) {
-            $document->update([
+            $uncertain = $e instanceof CertifierTimeoutException;
+            $error = $uncertain
+                ? $e->getMessage() . ' El DTE pudo haberse certificado en Guatefacturas: verifica en su portal antes de reintentar.'
+                : $e->getMessage();
+
+            $attributes = [
                 'status' => FelDocument::STATUS_ERROR,
                 'request_xml' => $xml,
-                'soap_request' => $soapRequest,
-                'error_message' => $e->getMessage(),
-            ]);
+                'soap_request' => $redactedSoapRequest,
+                'error_message' => $error,
+            ];
+            if ($uncertain) {
+                $attributes['metadata'] = array_merge($document->metadata ?: [], ['certification_uncertain' => true]);
+            }
+            $document->update($attributes);
 
             Log::error('FEL certification failed', [
                 'document_id' => $document->id,
                 'source_type' => $document->source_type,
                 'source_id' => $document->source_id,
                 'document_type' => $data->documentType,
+                'uncertain' => $uncertain,
                 'error' => $e->getMessage(),
             ]);
 
             return [
                 'success' => false,
-                'error' => $e->getMessage(),
+                'error' => $error,
+                'uncertain' => $uncertain,
                 'debug' => [
                     'request_xml' => $xml,
-                    'soap_request' => $soapRequest,
+                    'soap_request' => $redactedSoapRequest,
                 ],
             ];
         }
+    }
+
+    /**
+     * Reemplaza el password FEL de un envelope SOAP. Sirve también para limpiar
+     * envelopes guardados por versiones anteriores del package.
+     */
+    public static function redactCredentials(string $soapRequest): string
+    {
+        return preg_replace('/(<pPassword>).*?(<\/pPassword>)/s', '$1********$2', $soapRequest) ?? $soapRequest;
     }
 
     public function annul(FelDocument $document, string $reason, array $context = []): array
@@ -251,8 +275,12 @@ XML;
 
         $responseBody = curl_exec($curl);
         $error = curl_error($curl);
+        $errno = curl_errno($curl);
         curl_close($curl);
 
+        if ($errno === CURLE_OPERATION_TIMEDOUT) {
+            throw new CertifierTimeoutException('cURL Error: ' . $error);
+        }
         if ($error) {
             throw new Exception('cURL Error: ' . $error);
         }
