@@ -219,7 +219,17 @@ if ($result['success']) {
 }
 ```
 
-Si Ainnova / Guatefacturas responde correctamente, el documento queda con status `CERTIFIED`. Si el certificador falla, queda con status `ERROR` y se conserva `request_xml`, `soap_request`, `response_body` o `error_message` segun aplique.
+Si Ainnova / Guatefacturas responde correctamente, el documento queda con status `CERTIFIED`. Si el certificador falla, queda con status `ERROR` y se conserva `request_xml`, `soap_request`, `response_body` o `error_message` segun aplique. El `soap_request` guardado nunca incluye el password FEL.
+
+Si el certificador no responde a tiempo, el resultado trae `uncertain: true`. El DTE pudo haberse certificado del lado de Guatefacturas, asi que verificalo en su portal antes de reintentar.
+
+### Descuentos
+
+`FelItemData::$discount` es el monto de descuento de la linea, no un porcentaje. Se resta del importe bruto (`cantidad * precio`) y el IVA se calcula sobre el resultado. `unitPrice` debe ser el precio sin descuento.
+
+### Totales
+
+`total` se guarda en `fel_documents`, pero lo que se certifica es la suma de los items. Si no coinciden, se registra un warning y `metadata.total_mismatch`. Para rechazar esos documentos, activa `strict_totals` en `config/fel.php`.
 
 ## Reintentar un documento con error
 
@@ -232,6 +242,8 @@ $data = app(OrderFelMapper::class)->map($order, $document->metadata['options'] ?
 
 $result = app(FelManager::class)->certifyExisting($document, $data);
 ```
+
+Si el documento ya esta `CERTIFIED`, no se vuelve a enviar: el resultado trae `success: true` y `already_certified: true`. Si otro proceso lo esta certificando en ese momento, trae `busy: true`.
 
 ## Anular un DTE
 
@@ -246,7 +258,16 @@ $result = app(FelManager::class)->annul($document, 'Anulacion solicitada por el 
 ]);
 ```
 
-Si la anulacion es aceptada, el documento pasa a status `ANNULLED` y se crea un registro en `fel_annulments`.
+Si la anulacion es aceptada, el documento pasa a status `ANNULLED` y se crea un registro en `fel_annulments`. Solo se pueden anular documentos `CERTIFIED` con serie y preimpreso; en otro caso el resultado trae `success: false` y `annulment: null`.
+
+## Limpiar passwords guardados por versiones anteriores
+
+Antes de v1.1.0, `fel_documents.soap_request` guardaba el password FEL en texto plano. Para limpiarlo:
+
+```bash
+php artisan fel:redact-credentials --dry-run
+php artisan fel:redact-credentials
+```
 
 ## Configuracion para POS
 

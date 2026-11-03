@@ -28,6 +28,15 @@ trait XmlHelpers
         return function_exists('mb_substr') ? mb_substr($clean, 0, $maxLength) : substr($clean, 0, $maxLength);
     }
 
+    /**
+     * Texto limpio, recortado y escapado para SimpleXMLElement::addChild(),
+     * que no escapa "&" por su cuenta y lo descarta sin aviso.
+     */
+    protected function text(string $value, int $maxLength): string
+    {
+        return htmlspecialchars($this->limitString($value, $maxLength), ENT_XML1 | ENT_NOQUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    }
+
     protected function dec(float $value, int $decimals = 2): string
     {
         return number_format(round($value, $decimals), $decimals, '.', '');
