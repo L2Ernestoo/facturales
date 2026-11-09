@@ -5,6 +5,7 @@ namespace Lc\Fel\Models;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Facades\Log;
 use Lc\Fel\Models\Concerns\UsesFelTable;
 
 class FelCompanyCredential extends Model
@@ -68,6 +69,12 @@ class FelCompanyCredential extends Model
         try {
             return Crypt::decryptString($value);
         } catch (\Throwable) {
+            // Se conserva el valor para no romper credenciales guardadas en
+            // texto plano, pero puede ser un APP_KEY distinto al que las cifró.
+            Log::warning('FEL credential could not be decrypted; using the stored value as plain text.', [
+                'fel_company_credential_id' => $this->getKey(),
+            ]);
+
             return $value;
         }
     }

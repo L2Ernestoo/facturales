@@ -51,14 +51,14 @@ class GeneralDocumentBuilder implements DocumentBuilderInterface
         foreach ($data->items as $item) {
             $line = $this->buildLineData($item, $taxMode);
             $productos = $detalles->addChild('Productos');
-            $productos->addChild('Producto', $this->limitString($line['codigo'], 20));
-            $productos->addChild('Descripcion', $this->limitString($line['descripcion'], 2000));
+            $productos->addChild('Producto', $this->text($line['codigo'], 20));
+            $productos->addChild('Descripcion', $this->text($line['descripcion'], 2000));
             $productos->addChild('Medida', $line['medida']);
             $productos->addChild('Cantidad', $this->dec($line['cantidad'], 5));
             $productos->addChild('Precio', $this->dec($line['precio'], 7));
-            $productos->addChild('PorcDesc', $this->dec(0, 6));
+            $productos->addChild('PorcDesc', $this->dec($line['porc_desc'], 6));
             $productos->addChild('ImpBruto', $this->dec($line['imp_bruto']));
-            $productos->addChild('ImpDescuento', $this->dec(0));
+            $productos->addChild('ImpDescuento', $this->dec($line['imp_descuento']));
             $productos->addChild('ImpExento', $this->dec($line['imp_exento']));
             $productos->addChild('ImpOtros', $this->dec(0));
             $productos->addChild('ImpNeto', $this->dec($line['imp_neto']));
@@ -68,6 +68,7 @@ class GeneralDocumentBuilder implements DocumentBuilderInterface
             $productos->addChild('TipoVentaDet', $tipoVentaDet);
 
             $totals['bruto'] += $line['imp_bruto'];
+            $totals['descuento'] += $line['imp_descuento'];
             $totals['exento'] += $line['imp_exento'];
             $totals['neto'] += $line['imp_neto'];
             $totals['iva'] += $line['imp_iva'];
@@ -77,8 +78,8 @@ class GeneralDocumentBuilder implements DocumentBuilderInterface
         if ($this->requiresAssociatedDocument()) {
             $associated = $this->resolveAssociatedDocument($options);
             $docAsociados = $detalles->addChild('DocAsociados');
-            $docAsociados->addChild('DASerie', $this->limitString($associated['serie'], 20));
-            $docAsociados->addChild('DAPreimpreso', $this->limitString((string) $associated['preimpreso'], 18));
+            $docAsociados->addChild('DASerie', $this->text($associated['serie'], 20));
+            $docAsociados->addChild('DAPreimpreso', $this->text((string) $associated['preimpreso'], 18));
         }
 
         $totales = $encabezado->addChild('Totales');
@@ -100,9 +101,9 @@ class GeneralDocumentBuilder implements DocumentBuilderInterface
     protected function appendReceptor(SimpleXMLElement $encabezado, FelDocumentData $data): void
     {
         $receptor = $encabezado->addChild('Receptor');
-        $receptor->addChild('NITReceptor', $this->limitString($this->normalizeNit($data->receiver->nit), 20));
-        $receptor->addChild('Nombre', $this->limitString($data->receiver->name ?: 'Consumidor Final', 200));
-        $receptor->addChild('Direccion', $this->limitString($data->receiver->address ?: 'Ciudad', 200));
+        $receptor->addChild('NITReceptor', $this->text($this->normalizeNit($data->receiver->nit), 20));
+        $receptor->addChild('Nombre', $this->text($data->receiver->name ?: 'Consumidor Final', 200));
+        $receptor->addChild('Direccion', $this->text($data->receiver->address ?: 'Ciudad', 200));
     }
 
     protected function appendInfoDoc(SimpleXMLElement $encabezado, FelDocumentData $data, string $tipoVenta): void
@@ -114,10 +115,10 @@ class GeneralDocumentBuilder implements DocumentBuilderInterface
         $infoDoc->addChild('Fecha', $data->date->format('d/m/Y'));
         $infoDoc->addChild('Moneda', (string) ((int) ($options['moneda'] ?? 1)));
         $infoDoc->addChild('Tasa', $this->dec((float) ($options['tasa'] ?? 1), 6));
-        $infoDoc->addChild('Referencia', $this->limitString((string) ($options['referencia'] ?? $data->reference), 40));
-        $infoDoc->addChild('NumeroAcceso', $this->limitString((string) ($options['numero_acceso'] ?? ''), 10));
-        $infoDoc->addChild('SerieAdmin', $this->limitString((string) ($options['serie_admin'] ?? ''), 20));
-        $infoDoc->addChild('NumeroAdmin', $this->limitString((string) ($options['numero_admin'] ?? ''), 18));
+        $infoDoc->addChild('Referencia', $this->text((string) ($options['referencia'] ?? $data->reference), 40));
+        $infoDoc->addChild('NumeroAcceso', $this->text((string) ($options['numero_acceso'] ?? ''), 10));
+        $infoDoc->addChild('SerieAdmin', $this->text((string) ($options['serie_admin'] ?? ''), 20));
+        $infoDoc->addChild('NumeroAdmin', $this->text((string) ($options['numero_admin'] ?? ''), 18));
 
         if (array_key_exists('reversion', $options) && trim((string) $options['reversion']) !== '') {
             $infoDoc->addChild('Reversion', strtoupper((string) $options['reversion']) === 'S' ? 'S' : 'N');
@@ -130,7 +131,7 @@ class GeneralDocumentBuilder implements DocumentBuilderInterface
         $additional = [];
 
         if (!in_array($this->documentType, ['NABN', 'NCRE', 'NDEB'], true)) {
-            $additional['TipoReceptor'] = (string) ($options['tipo_receptor'] ?? ($data->receiver->nit === 'CF' ? '4' : '4'));
+            $additional['TipoReceptor'] = (string) ($options['tipo_receptor'] ?? '4');
         }
 
         if (in_array($this->documentType, ['FCAM', 'FCAP'], true)) {
@@ -162,7 +163,7 @@ class GeneralDocumentBuilder implements DocumentBuilderInterface
                 : trim((string) $value);
 
             if ($normalized !== '') {
-                $datosAdicionales->addChild($tag, $this->limitString($normalized, 2000));
+                $datosAdicionales->addChild($tag, $this->text($normalized, 2000));
             }
         }
     }
@@ -181,13 +182,13 @@ class GeneralDocumentBuilder implements DocumentBuilderInterface
             ? $requestedAbonos
             : [[
                 'numero_abono' => 1,
-                'fecha_vencimiento' => Carbon::now()->addDays(max(1, (int) ($options['credit_days'] ?? 30)))->format('Ymd'),
+                'fecha_vencimiento' => $data->date->copy()->addDays(max(1, (int) ($options['credit_days'] ?? 30)))->format('Ymd'),
                 'monto_abono' => $total,
             ]];
 
         $abonosFactura = $encabezado->addChild('AbonosFacturaCambiaria');
         foreach ($abonos as $index => $row) {
-            $fecha = (string) ($row['fecha_vencimiento'] ?? Carbon::now()->addDays(30)->format('Ymd'));
+            $fecha = (string) ($row['fecha_vencimiento'] ?? $data->date->copy()->addDays(30)->format('Ymd'));
             if (preg_match('/^\d{8}$/', $fecha) !== 1) {
                 $fecha = Carbon::parse($fecha)->format('Ymd');
             }
@@ -205,7 +206,13 @@ class GeneralDocumentBuilder implements DocumentBuilderInterface
             throw new Exception('Los items enviados para el documento FEL tienen cantidad/precio inválidos.');
         }
 
-        $tax = $this->calculateTaxAmounts($item->quantity, $item->unitPrice, $taxMode);
+        $impBruto = round($item->quantity * $item->unitPrice, 2);
+        $impDescuento = round($item->discount, 2);
+        if ($impDescuento < 0 || $impDescuento > $impBruto) {
+            throw new Exception("El descuento del item {$item->code} debe estar entre 0 y el importe bruto de la línea.");
+        }
+
+        $tax = $this->calculateTaxAmounts($item->quantity, $item->unitPrice, $taxMode, $impDescuento);
 
         return [
             'codigo' => $item->code,
@@ -217,28 +224,39 @@ class GeneralDocumentBuilder implements DocumentBuilderInterface
         ];
     }
 
-    protected function calculateTaxAmounts(float $cantidad, float $precio, string $taxMode): array
+    /**
+     * El descuento es un monto por línea: se resta del bruto y los impuestos
+     * se calculan sobre lo que queda.
+     */
+    protected function calculateTaxAmounts(float $cantidad, float $precio, string $taxMode, float $descuento = 0.0): array
     {
         $impBruto = round($cantidad * $precio, 2);
+        $impDescuento = round($descuento, 2);
+        $impTotal = round($impBruto - $impDescuento, 2);
+        $porcDesc = $impBruto > 0 ? round(($impDescuento / $impBruto) * 100, 6) : 0.0;
 
         if ($taxMode === 'EXEMPT') {
             return [
                 'imp_bruto' => $impBruto,
-                'imp_exento' => $impBruto,
+                'imp_descuento' => $impDescuento,
+                'porc_desc' => $porcDesc,
+                'imp_exento' => $impTotal,
                 'imp_neto' => 0.0,
                 'imp_iva' => 0.0,
-                'imp_total' => $impBruto,
+                'imp_total' => $impTotal,
             ];
         }
 
-        $impNeto = round($impBruto / (1 + self::IVA_RATE), 2);
+        $impNeto = round($impTotal / (1 + self::IVA_RATE), 2);
 
         return [
             'imp_bruto' => $impBruto,
+            'imp_descuento' => $impDescuento,
+            'porc_desc' => $porcDesc,
             'imp_exento' => 0.0,
             'imp_neto' => $impNeto,
-            'imp_iva' => round($impBruto - $impNeto, 2),
-            'imp_total' => $impBruto,
+            'imp_iva' => round($impTotal - $impNeto, 2),
+            'imp_total' => $impTotal,
         ];
     }
 

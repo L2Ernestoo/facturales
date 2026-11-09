@@ -30,4 +30,16 @@ class GuatefacturasCertifierTest extends TestCase
         $this->assertSame('Ciudad', $parsed['direccion']);
         $this->assertSame('ORD-5', $parsed['referencia']);
     }
+
+    public function test_redact_credentials_hides_only_the_password(): void
+    {
+        $soap = "<pUsuario>USR</pUsuario>\n<pPassword>s3cr&amp;t</pPassword>\n<pXml><![CDATA[<a/>]]></pXml>";
+
+        $redacted = GuatefacturasCertifier::redactCredentials($soap);
+
+        $this->assertStringNotContainsString('s3cr', $redacted);
+        $this->assertStringContainsString('<pPassword>********</pPassword>', $redacted);
+        $this->assertStringContainsString('<pUsuario>USR</pUsuario>', $redacted);
+        $this->assertStringContainsString('<pXml><![CDATA[<a/>]]></pXml>', $redacted);
+    }
 }

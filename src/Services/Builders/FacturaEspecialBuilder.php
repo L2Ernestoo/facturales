@@ -37,9 +37,9 @@ class FacturaEspecialBuilder implements DocumentBuilderInterface
         $xml = new SimpleXMLElement('<DocElectronico/>');
         $encabezado = $xml->addChild('Encabezado');
         $receptor = $encabezado->addChild('Receptor');
-        $receptor->addChild('NITVendedor', $this->limitString($this->normalizeNit($options['nit_vendedor'] ?? $data->receiver->nit), 20));
-        $receptor->addChild('NombreVendedor', $this->limitString((string) ($options['nombre_vendedor'] ?? $data->receiver->name), 200));
-        $receptor->addChild('Direccion', $this->limitString((string) ($options['direccion_vendedor'] ?? $data->receiver->address), 200));
+        $receptor->addChild('NITVendedor', $this->text($this->normalizeNit($options['nit_vendedor'] ?? $data->receiver->nit), 20));
+        $receptor->addChild('NombreVendedor', $this->text((string) ($options['nombre_vendedor'] ?? $data->receiver->name), 200));
+        $receptor->addChild('Direccion', $this->text((string) ($options['direccion_vendedor'] ?? $data->receiver->address), 200));
 
         $infoDoc = $encabezado->addChild('InfoDoc');
         $infoDoc->addChild('TipoVenta', $tipoVenta);
@@ -48,11 +48,11 @@ class FacturaEspecialBuilder implements DocumentBuilderInterface
         $infoDoc->addChild('Moneda', (string) ((int) ($options['moneda'] ?? 1)));
         $infoDoc->addChild('Tasa_Cambio', $this->dec((float) ($options['tasa_cambio'] ?? 1), 6));
         $infoDoc->addChild('TipoDocIdentificacion', (string) ((int) ($options['tipo_doc_identificacion'] ?? 1)));
-        $infoDoc->addChild('NumeroIdentificacion', $this->limitString((string) ($options['numero_identificacion'] ?? $data->receiver->nit), 40));
+        $infoDoc->addChild('NumeroIdentificacion', $this->text((string) ($options['numero_identificacion'] ?? $data->receiver->nit), 40));
         $infoDoc->addChild('PaisEmision', (string) ((int) ($options['pais_emision'] ?? 1)));
         $infoDoc->addChild('DepartamentoEmision', (string) ((int) ($options['departamento_emision'] ?? 1)));
         $infoDoc->addChild('MunicipioEmision', (string) ((int) ($options['municipio_emision'] ?? 1)));
-        $infoDoc->addChild('Referencia', $this->limitString((string) ($options['referencia'] ?? $data->reference), 40));
+        $infoDoc->addChild('Referencia', $this->text((string) ($options['referencia'] ?? $data->reference), 40));
         $infoDoc->addChild('PorcISR', $this->dec($porcIsr, 4));
 
         if (array_key_exists('reversion', $options)) {
@@ -71,8 +71,8 @@ class FacturaEspecialBuilder implements DocumentBuilderInterface
 
         $detalles = $xml->addChild('Detalles');
         $productos = $detalles->addChild('Productos');
-        $productos->addChild('Producto', $this->limitString((string) ($options['producto_codigo'] ?? $first->code), 20));
-        $productos->addChild('Descripcion', $this->limitString((string) ($options['descripcion'] ?? $first->description), 2000));
+        $productos->addChild('Producto', $this->text((string) ($options['producto_codigo'] ?? $first->code), 20));
+        $productos->addChild('Descripcion', $this->text((string) ($options['descripcion'] ?? $first->description), 2000));
         $productos->addChild('Medida', (string) ((int) ($options['medida_codigo'] ?? $first->measure)));
         $productos->addChild('Cantidad', $this->dec((float) ($options['cantidad'] ?? 1), 5));
         $productos->addChild('Precio', $this->dec($bruto, 7));

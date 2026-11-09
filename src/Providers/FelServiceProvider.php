@@ -3,6 +3,7 @@
 namespace Lc\Fel\Providers;
 
 use Illuminate\Support\ServiceProvider;
+use Lc\Fel\Console\RedactStoredCredentialsCommand;
 use Lc\Fel\Contracts\CertifierInterface;
 use Lc\Fel\Contracts\FelConfigRepositoryInterface;
 
@@ -24,6 +25,9 @@ class FelServiceProvider extends ServiceProvider
 
             return $app->make($class ?: config('fel.certifiers.guatefacturas'));
         });
+
+        // En register() y no en boot(): hay apps que sobrescriben boot().
+        $this->commands([RedactStoredCredentialsCommand::class]);
     }
 
     public function boot(): void
