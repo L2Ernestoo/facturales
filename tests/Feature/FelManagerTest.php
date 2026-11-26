@@ -163,6 +163,119 @@ class FelManagerTest extends FeatureTestCase
         $this->assertSame(0, FelDocument::query()->count());
     }
 
+    public function test_repeated_issue_reuses_certificate_even_at_monthly_limit(): void
+    {
+        $data = $this->documentData($this->createCompany(['monthly_dte_limit' => 1]));
+        $first = $this->manager()->issue($data);
+        $second = $this->manager()->issue($data);
+
+        $this->assertTrue($second['success']);
+        $this->assertTrue($second['already_certified']);
+        $this->assertTrue($first['document']->is($second['document']));
+        $this->assertSame(1, FelDocument::count());
+        $this->assertSame(1, $this->fake->certifyCalls);
+    }
+
+    public function test_failed_issue_is_reused_for_retry_and_replacement_is_allowed_after_annulment(): void
+    {
+        $data = $this->documentData($this->createCompany());
+        $this->fake->succeed = false;
+        $document = $this->manager()->issue($data)['document'];
+
+        $this->fake->succeed = true;
+        $duplicate = $this->manager()->issue($data);
+        $this->assertTrue($duplicate['blocked']);
+        $this->assertTrue($document->is($duplicate['document']));
+        $this->assertSame(1, $this->fake->certifyCalls);
+
+        $this->assertTrue($this->manager()->certifyExisting($document, $data)['success']);
+        $this->assertTrue($this->manager()->annul($document, 'Sustituir DTE')['success']);
+        $replacement = $this->manager()->issue($data);
+        $this->assertTrue($replacement['success']);
+        $this->assertFalse($document->is($replacement['document']));
+        $this->assertSame(3, $this->fake->certifyCalls);
+    }
+
+    public function test_pending_and_uncertain_issuance_cannot_be_resent(): void
+    {
+        $data = $this->documentData($this->createCompany());
+        $this->fake->succeed = false;
+        $this->fake->uncertain = true;
+        $result = $this->manager()->issue($data);
+        $document = $result['document'];
+
+        $this->assertTrue($result['uncertain']);
+        $this->assertTrue($document->metadata['certification_uncertain']);
+        $this->assertArrayNotHasKey('certification_in_progress', $document->metadata);
+
+        foreach ([
+            [FelDocument::STATUS_ERROR, ['certification_uncertain' => true]],
+            [FelDocument::STATUS_PENDING, []],
+            [FelDocument::STATUS_ERROR, ['certification_in_progress' => true]],
+        ] as [$status, $metadata]) {
+            $document->update(['status' => $status, 'metadata' => $metadata]);
+            $this->assertTrue($this->manager()->issue($data)['uncertain']);
+            $this->assertTrue($this->manager()->certifyExisting($document, $data)['uncertain']);
+        }
+
+        $this->assertSame(1, $this->fake->certifyCalls);
+        $this->assertSame(1, FelDocument::count());
+    }
+
+    public function test_retry_checks_strict_total_before_changing_snapshot(): void
+    {
+        $company = $this->createCompany();
+        $this->fake->succeed = false;
+        $document = $this->manager()->issue($this->documentData($company))['document'];
+        $this->fake->succeed = true;
+        config(['fel.strict_totals' => true]);
+
+        $result = $this->manager()->certifyExisting($document, $this->documentData($company, total: 150));
+
+        $this->assertTrue($result['blocked']);
+        $this->assertSame('112.00', $document->fresh()->total);
+        $this->assertSame(1, $this->fake->certifyCalls);
+        $this->assertTrue($this->manager()->certifyExisting($document, $this->documentData($company))['success']);
+    }
+
+    public function test_retry_preserves_company_and_does_not_resend_a_legacy_duplicate(): void
+    {
+        $company = $this->createCompany();
+        $otherCompany = $this->createCompany();
+        $data = $this->documentData($company);
+        $document = $this->manager()->issue($data)['document'];
+        $duplicate = $document->replicate(['fel_uuid']);
+        $duplicate->status = FelDocument::STATUS_ERROR;
+        $duplicate->save();
+
+        $mismatch = $this->manager()->certifyExisting($duplicate, $this->documentData($otherCompany));
+        $this->assertTrue($mismatch['blocked']);
+
+        $result = $this->manager()->certifyExisting($duplicate, $data);
+        $this->assertTrue($result['already_certified']);
+        $this->assertTrue($document->is($result['document']));
+        $this->assertSame(1, $this->fake->certifyCalls);
+    }
+
+    public function test_uncertain_annulment_preserves_certification_and_blocks_sending_again(): void
+    {
+        $data = $this->documentData($this->createCompany());
+        $document = $this->manager()->issue($data)['document'];
+        $this->fake->succeed = false;
+        $this->fake->uncertain = true;
+
+        $first = $this->manager()->annul($document, 'Prueba');
+        $second = $this->manager()->annul($document, 'Reintento');
+
+        $this->assertFalse($first['success']);
+        $this->assertTrue($first['uncertain']);
+        $this->assertSame('UNCERTAIN', $first['annulment']->status);
+        $this->assertSame(FelDocument::STATUS_CERTIFIED, $document->fresh()->status);
+        $this->assertTrue($second['blocked']);
+        $this->assertTrue($first['annulment']->is($second['annulment']));
+        $this->assertSame(1, $this->fake->annulCalls);
+    }
+
     public function test_each_company_uses_its_own_certifier(): void
     {
         $this->app->forgetInstance(CertifierInterface::class);

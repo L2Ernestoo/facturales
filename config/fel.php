@@ -8,7 +8,7 @@ use Lc\Fel\Services\Certifiers\GuatefacturasCertifier;
 return [
     'timezone' => 'America/Guatemala',
 
-    // true: issue() rechaza documentos cuyo total no coincide con la suma de
+    // true: issue() y certifyExisting() rechazan un total que no coincide con la suma de
     // sus items. false: solo se registra un warning y metadata.total_mismatch.
     'strict_totals' => false,
 

@@ -118,6 +118,8 @@ FelBranchSetting::create([
 
 > Nota: `password` y `basic_password` se cifran automaticamente. No los guardes en `.env`.
 
+En Guatefacturas, configura la URL directa del ambiente seleccionado. El modo `test` requiere `url_test` y `prod` requiere `url_prod`.
+
 ## Mapear una venta, orden o factura
 
 Cada aplicacion debe convertir su modelo fuente a `FelDocumentData`. Para eso puedes implementar `FelSourceMapperInterface`.
@@ -221,7 +223,9 @@ if ($result['success']) {
 
 Si Ainnova / Guatefacturas responde correctamente, el documento queda con status `CERTIFIED`. Si el certificador falla, queda con status `ERROR` y se conserva `request_xml`, `soap_request`, `response_body` o `error_message` segun aplique. El `soap_request` guardado nunca incluye el password FEL.
 
-Si el certificador no responde a tiempo, el resultado trae `uncertain: true`. El DTE pudo haberse certificado del lado de Guatefacturas, asi que verificalo en su portal antes de reintentar.
+Si repites `issue()` con la misma empresa, tipo de DTE, `sourceType` y `sourceId`, el paquete devuelve la certificación existente con `already_certified: true`. Si el intento anterior quedó con un error confirmado, devuelve `blocked: true` y el registro que debes pasar a `certifyExisting()`. Usa un origen estable por operación facturable.
+
+Si el resultado trae `uncertain: true`, comprueba y concilia el estado en Guatefacturas antes de reintentar. Consulta las [notas de actualización y conciliación](CHANGELOG.md#próxima-versión).
 
 ### Descuentos
 
@@ -229,7 +233,7 @@ Si el certificador no responde a tiempo, el resultado trae `uncertain: true`. El
 
 ### Totales
 
-`total` se guarda en `fel_documents`, pero lo que se certifica es la suma de los items. Si no coinciden, se registra un warning y `metadata.total_mismatch`. Para rechazar esos documentos, activa `strict_totals` en `config/fel.php`.
+`total` se guarda en `fel_documents`, pero lo que se certifica es la suma de los items. Si no coinciden, se registra un warning y `metadata.total_mismatch`. Para rechazarlos tanto al emitir como al reintentar, activa `strict_totals` en `config/fel.php`.
 
 ## Reintentar un documento con error
 
@@ -243,7 +247,7 @@ $data = app(OrderFelMapper::class)->map($order, $document->metadata['options'] ?
 $result = app(FelManager::class)->certifyExisting($document, $data);
 ```
 
-Si el documento ya esta `CERTIFIED`, no se vuelve a enviar: el resultado trae `success: true` y `already_certified: true`. Si otro proceso lo esta certificando en ese momento, trae `busy: true`.
+El reintento conserva la empresa, el origen y el tipo de DTE. Si el documento ya está certificado, el resultado trae `success: true` y `already_certified: true`. Si el bloqueo temporal está ocupado, trae `busy: true`. Un intento pendiente o incierto devuelve `blocked: true` y `uncertain: true` hasta conciliar su estado.
 
 ## Anular un DTE
 
@@ -258,7 +262,7 @@ $result = app(FelManager::class)->annul($document, 'Anulacion solicitada por el 
 ]);
 ```
 
-Si la anulacion es aceptada, el documento pasa a status `ANNULLED` y se crea un registro en `fel_annulments`. Solo se pueden anular documentos `CERTIFIED` con serie y preimpreso; en otro caso el resultado trae `success: false` y `annulment: null`.
+Si Guatefacturas confirma la anulación, el documento y su intento en `fel_annulments` pasan a `ANNULLED`. Para anular se requiere un documento `CERTIFIED` con serie y preimpreso. Un intento incierto queda en `UNCERTAIN` y bloquea otro envío hasta conciliar el resultado.
 
 ## Limpiar passwords guardados por versiones anteriores
 

@@ -9,8 +9,10 @@ use Lc\Fel\Contracts\CertifierInterface;
 use Lc\Fel\Contracts\FelConfigRepositoryInterface;
 use Lc\Fel\Data\FelDocumentData;
 use Lc\Fel\Exceptions\CertifierTimeoutException;
+use Lc\Fel\Exceptions\CertifierUncertainException;
 use Lc\Fel\Models\FelDocument;
 use Lc\Fel\Services\DocumentBuilderFactory;
+use SimpleXMLElement;
 
 class GuatefacturasCertifier implements CertifierInterface
 {
@@ -23,7 +25,8 @@ class GuatefacturasCertifier implements CertifierInterface
     public function certify(FelDocumentData $data, FelDocument $document): array
     {
         $xml = null;
-        $soapRequest = null;
+        $responseBody = null;
+        $confirmed = false;
         $redactedSoapRequest = null;
 
         try {
@@ -47,17 +50,18 @@ class GuatefacturasCertifier implements CertifierInterface
                 'error_message' => null,
             ]);
 
-            $responseBody = $this->executeSoapRequest($soapRequest, 'http://dbguatefac/Guatefac.wsdl/generaDocumento', $config);
+            [$responseBody, $httpStatus] = $this->executeSoapRequest($soapRequest, 'http://dbguatefac/Guatefac.wsdl/generaDocumento', $config);
+            $this->requireSuccessfulHttpStatus($httpStatus);
             $parsed = $this->parseGenerateSoapResponse($responseBody);
-
-            if (!isset($parsed['uuid'])) {
-                throw new Exception($parsed['error'] ?? 'Respuesta inválida del certificador.');
+            if (isset($parsed['error'])) {
+                $this->throwResponseError($parsed);
             }
 
+            $confirmed = true;
             $document->update([
-                'fel_serie' => $parsed['serie'] ?? null,
-                'fel_preimpreso' => $parsed['preimpreso'] ?? null,
-                'fel_uuid' => $parsed['uuid'] ?? null,
+                'fel_serie' => $parsed['serie'],
+                'fel_preimpreso' => $parsed['preimpreso'],
+                'fel_uuid' => $parsed['uuid'],
                 'metadata' => array_merge($document->metadata ?: [], [
                     'certifier_response' => $this->certifierResponseMetadata($parsed),
                 ]),
@@ -76,7 +80,7 @@ class GuatefacturasCertifier implements CertifierInterface
                 ]),
             ];
         } catch (Exception $e) {
-            $uncertain = $e instanceof CertifierTimeoutException;
+            $uncertain = $confirmed || $e instanceof CertifierUncertainException;
             $error = $uncertain
                 ? $e->getMessage() . ' El DTE pudo haberse certificado en Guatefacturas: verifica en su portal antes de reintentar.'
                 : $e->getMessage();
@@ -85,6 +89,7 @@ class GuatefacturasCertifier implements CertifierInterface
                 'status' => FelDocument::STATUS_ERROR,
                 'request_xml' => $xml,
                 'soap_request' => $redactedSoapRequest,
+                'response_body' => $responseBody,
                 'error_message' => $error,
             ];
             if ($uncertain) {
@@ -124,6 +129,7 @@ class GuatefacturasCertifier implements CertifierInterface
 
     public function annul(FelDocument $document, string $reason, array $context = []): array
     {
+        $responseBody = null;
         try {
             $company = $document->company;
             if (!$company) {
@@ -140,11 +146,16 @@ class GuatefacturasCertifier implements CertifierInterface
                 $reason,
                 $config
             );
-            $responseBody = $this->executeSoapRequest($soapRequest, 'http://dbguatefac/Guatefac.wsdl/anulaDocumento', $config);
+            [$responseBody, $httpStatus] = $this->executeSoapRequest($soapRequest, 'http://dbguatefac/Guatefac.wsdl/anulaDocumento', $config);
+            $this->requireSuccessfulHttpStatus($httpStatus);
             $parsed = $this->parseAnnulSoapResponse($responseBody);
+            if (!$parsed['success']) {
+                $this->throwResponseError($parsed);
+            }
 
-            if (($parsed['success'] ?? false) !== true) {
-                throw new Exception($parsed['error'] ?? 'No se pudo anular el documento FEL.');
+            if (($parsed['serie'] !== '' && strcasecmp($parsed['serie'], (string) $document->fel_serie) !== 0)
+                || ($parsed['preimpreso'] !== '' && $parsed['preimpreso'] !== (string) $document->fel_preimpreso)) {
+                throw new CertifierUncertainException('La anulación devuelta corresponde a otra serie o preimpreso.');
             }
 
             return ['success' => true, 'data' => array_merge($parsed, ['raw_response' => $responseBody])];
@@ -154,7 +165,14 @@ class GuatefacturasCertifier implements CertifierInterface
                 'error' => $e->getMessage(),
             ]);
 
-            return ['success' => false, 'error' => $e->getMessage()];
+            $uncertain = $e instanceof CertifierUncertainException;
+
+            return [
+                'success' => false,
+                'error' => $uncertain ? $e->getMessage() . ' Verifica la anulación en Guatefacturas antes de reintentar.' : $e->getMessage(),
+                'uncertain' => $uncertain,
+                'data' => ['raw_response' => $responseBody],
+            ];
         }
     }
 
@@ -166,7 +184,6 @@ class GuatefacturasCertifier implements CertifierInterface
         }
 
         return $this->resolveConfigFromCompany($company) + [
-            'mode' => $data->company->mode,
             'nit' => $data->company->nit,
             'establishment_code' => $data->branch->establishmentCode,
         ];
@@ -180,7 +197,7 @@ class GuatefacturasCertifier implements CertifierInterface
         }
 
         return [
-            'mode' => $company->mode ?: config('fel.defaults.mode', 'test'),
+            'mode' => $company->mode,
             'user' => $credential->user,
             'pass' => $credential->password_plain,
             'nit' => $company->nit,
@@ -248,16 +265,14 @@ XML;
 XML;
     }
 
-    private function executeSoapRequest(string $soapRequest, string $soapAction, array $config): string
+    private function executeSoapRequest(string $soapRequest, string $soapAction, array $config): array
     {
         $curl = curl_init();
         curl_setopt_array($curl, [
             CURLOPT_URL => $this->resolveServiceUrl($config),
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_ENCODING => '',
-            CURLOPT_MAXREDIRS => 10,
             CURLOPT_TIMEOUT => 30,
-            CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
             CURLOPT_CUSTOMREQUEST => 'POST',
             CURLOPT_POSTFIELDS => $soapRequest,
@@ -276,63 +291,109 @@ XML;
         $responseBody = curl_exec($curl);
         $error = curl_error($curl);
         $errno = curl_errno($curl);
+        $httpStatus = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
         curl_close($curl);
 
         if ($errno === CURLE_OPERATION_TIMEDOUT) {
             throw new CertifierTimeoutException('cURL Error: ' . $error);
         }
-        if ($error) {
+        if (in_array($errno, [CURLE_COULDNT_RESOLVE_HOST, CURLE_COULDNT_CONNECT, CURLE_SSL_CONNECT_ERROR, CURLE_SSL_CACERT], true)) {
             throw new Exception('cURL Error: ' . $error);
         }
-        if (!is_string($responseBody) || trim($responseBody) === '') {
-            throw new Exception('Respuesta vacía del certificador.');
+        if ($errno !== 0 || $responseBody === false) {
+            throw new CertifierUncertainException('cURL Error: ' . $error);
         }
 
-        return $responseBody;
+        return [$responseBody, $httpStatus];
+    }
+
+    private function requireSuccessfulHttpStatus(int $status): void
+    {
+        if ($status < 200 || $status >= 300) {
+            throw new CertifierUncertainException("El certificador devolvió HTTP {$status} sin una confirmación del DTE.");
+        }
+    }
+
+    private function throwResponseError(array $response): never
+    {
+        if ($response['uncertain'] ?? false) {
+            throw new CertifierUncertainException($response['error']);
+        }
+
+        throw new Exception($response['error']);
+    }
+
+    private function readSoapResult(string $soapResponse): array
+    {
+        $envelope = @simplexml_load_string($soapResponse, SimpleXMLElement::class, LIBXML_NONET | LIBXML_NOCDATA);
+        if ($envelope === false) {
+            return ['error' => 'Respuesta SOAP inválida del certificador.', 'uncertain' => true];
+        }
+
+        $body = '/*[local-name()="Envelope"]/*[local-name()="Body"]';
+        $fault = $envelope->xpath($body . '/*[local-name()="Fault"]/*[local-name()="faultstring" or local-name()="Reason"]');
+        if (!empty($fault)) {
+            $message = trim((string) $fault[0]);
+
+            return ['error' => $message ?: 'El certificador devolvió un error SOAP.', 'uncertain' => true];
+        }
+
+        $results = $envelope->xpath($body . '/*/*[local-name()="result" or local-name()="return"]');
+        if (count($results ?: []) !== 1) {
+            return ['error' => 'Formato de respuesta SOAP no reconocido.', 'uncertain' => true];
+        }
+
+        $children = $results[0]->xpath('./*');
+        if (count($children ?: []) > 1) {
+            return ['error' => 'El certificador devolvió varios resultados SOAP.', 'uncertain' => true];
+        }
+
+        $content = trim(isset($children[0]) ? (string) $children[0]->asXML() : (string) $results[0]);
+        if ($content === '') {
+            return ['error' => 'Respuesta SOAP vacía del certificador.', 'uncertain' => true];
+        }
+
+        $xml = str_starts_with($content, '<')
+            ? @simplexml_load_string($content, SimpleXMLElement::class, LIBXML_NONET | LIBXML_NOCDATA)
+            : null;
+        if ($xml === false) {
+            return ['error' => 'El XML de respuesta del certificador es inválido.', 'uncertain' => true];
+        }
+
+        $error = trim((string) ($xml->ERROR ?? $xml->Error ?? ''));
+        $message = trim((string) ($xml->RESULTADO ?? $xml->Resultado ?? ($xml ? (string) $xml : $content)));
+        if ($error !== '' || preg_match('/^(?:ERROR|RECHAZAD[OA]|RECHAZO)\b/iu', $message) === 1) {
+            return ['error' => $error !== '' ? $error : $message];
+        }
+
+        return ['message' => $message, 'xml' => $xml];
     }
 
     private function parseGenerateSoapResponse(string $soapResponse): array
     {
-        preg_match('/<(?:result|return)>(.*?)<\/(?:result|return)>/s', $soapResponse, $resultMatches);
-        if (!isset($resultMatches[1])) {
-            preg_match('/<faultstring>(.*?)<\/faultstring>/s', $soapResponse, $errorMatches);
-            return ['error' => html_entity_decode($errorMatches[1] ?? 'Formato de respuesta SOAP no reconocido.')];
+        $result = $this->readSoapResult($soapResponse);
+        if (isset($result['error'])) {
+            return $result;
         }
 
-        $decodedResult = trim(html_entity_decode($resultMatches[1]));
-        $xml = @simplexml_load_string($decodedResult);
-        if ($xml !== false && isset($xml->NumeroAutorizacion)) {
-            return [
-                'serie' => (string) ($xml->Serie ?? ''),
-                'preimpreso' => (string) ($xml->Preimpreso ?? ''),
-                'uuid' => (string) ($xml->NumeroAutorizacion ?? ''),
-                'nombre' => (string) ($xml->Nombre ?? ''),
-                'direccion' => (string) ($xml->Direccion ?? ''),
-                'telefono' => (string) ($xml->Telefono ?? ''),
-                'referencia' => (string) ($xml->Referencia ?? ''),
-            ];
+        $xml = $result['xml'];
+        $uuid = trim((string) ($xml->NumeroAutorizacion ?? ''));
+        $serie = trim((string) ($xml->Serie ?? ''));
+        $preimpreso = trim((string) ($xml->Preimpreso ?? ''));
+        if (preg_match('/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iD', $uuid) !== 1
+            || $serie === '' || $preimpreso === '') {
+            return ['error' => 'El certificador no confirmó la emisión con UUID, serie y preimpreso válidos.', 'uncertain' => true];
         }
 
-        if (preg_match('/NumeroAutorizacion>\s*([^<]+)\s*</', $decodedResult, $uuidMatches) === 1) {
-            preg_match('/Serie>\s*([^<]+)\s*</', $decodedResult, $serieMatches);
-            preg_match('/Preimpreso>\s*([^<]+)\s*</', $decodedResult, $preimpresoMatches);
-            preg_match('/Nombre>\s*([^<]*)\s*</', $decodedResult, $nombreMatches);
-            preg_match('/Direccion>\s*([^<]*)\s*</', $decodedResult, $direccionMatches);
-            preg_match('/Telefono>\s*([^<]*)\s*</', $decodedResult, $telefonoMatches);
-            preg_match('/Referencia>\s*([^<]*)\s*</', $decodedResult, $referenciaMatches);
-
-            return [
-                'serie' => $serieMatches[1] ?? '',
-                'preimpreso' => $preimpresoMatches[1] ?? '',
-                'uuid' => $uuidMatches[1],
-                'nombre' => $nombreMatches[1] ?? '',
-                'direccion' => $direccionMatches[1] ?? '',
-                'telefono' => $telefonoMatches[1] ?? '',
-                'referencia' => $referenciaMatches[1] ?? '',
-            ];
-        }
-
-        return ['error' => $decodedResult];
+        return [
+            'serie' => $serie,
+            'preimpreso' => $preimpreso,
+            'uuid' => $uuid,
+            'nombre' => (string) ($xml->Nombre ?? ''),
+            'direccion' => (string) ($xml->Direccion ?? ''),
+            'telefono' => (string) ($xml->Telefono ?? ''),
+            'referencia' => (string) ($xml->Referencia ?? ''),
+        ];
     }
 
     private function certifierResponseMetadata(array $parsed): array
@@ -347,33 +408,33 @@ XML;
 
     private function parseAnnulSoapResponse(string $soapResponse): array
     {
-        preg_match('/<(?:result|return)>(.*?)<\/(?:result|return)>/s', $soapResponse, $resultMatches);
-        if (!isset($resultMatches[1])) {
-            preg_match('/<faultstring>(.*?)<\/faultstring>/s', $soapResponse, $errorMatches);
-            return ['success' => false, 'error' => html_entity_decode($errorMatches[1] ?? 'Formato SOAP no reconocido al anular.')];
+        $result = $this->readSoapResult($soapResponse);
+        if (isset($result['error'])) {
+            return ['success' => false, ...$result];
         }
 
-        $decodedResult = trim(html_entity_decode($resultMatches[1]));
-        $xml = @simplexml_load_string($decodedResult);
-        if ($xml !== false) {
-            $resultado = (string) ($xml->RESULTADO ?? $xml->Resultado ?? '');
-            if (stripos($resultado, 'ERROR') !== false) {
-                return ['success' => false, 'error' => $resultado];
-            }
+        $xml = $result['xml'];
+        $message = $result['message'];
 
+        // Se requiere una confirmación afirmativa explícita del proveedor.
+        $success = preg_match(
+            '/^(?:OK|ÉXITO|EXITOS[OA]|ANULADO|ANULACI[ÓO]N (?:EXITOSA|CORRECTA|REALIZADA CORRECTAMENTE)|(?:EL )?DOCUMENTO (?:HA SIDO )?ANULADO(?: CORRECTAMENTE| EXITOSAMENTE| CON [ÉE]XITO)?)[.!]?$/iu',
+            $message
+        ) === 1;
+        if (!$success) {
             return [
-                'success' => true,
-                'message' => $resultado !== '' ? $resultado : 'Documento anulado correctamente.',
-                'serie' => (string) ($xml->SERIE ?? $xml->Serie ?? ''),
-                'preimpreso' => (string) ($xml->PREIMPRESO ?? $xml->Preimpreso ?? ''),
+                'success' => false,
+                'error' => 'El certificador no confirmó la anulación del DTE.',
+                'uncertain' => true,
             ];
         }
 
-        if (stripos($decodedResult, 'ERROR') !== false) {
-            return ['success' => false, 'error' => $decodedResult];
-        }
-
-        return ['success' => true, 'message' => $decodedResult !== '' ? $decodedResult : 'Documento anulado correctamente.'];
+        return [
+            'success' => true,
+            'message' => $message,
+            'serie' => trim((string) ($xml->SERIE ?? $xml->Serie ?? '')),
+            'preimpreso' => trim((string) ($xml->PREIMPRESO ?? $xml->Preimpreso ?? '')),
+        ];
     }
 
     private function getNumericDocType(string $documentType): int
@@ -396,22 +457,21 @@ XML;
     private function resolveServiceUrl(array $config): string
     {
         $mode = strtolower(trim((string) ($config['mode'] ?? '')));
-        $prod = trim((string) ($config['url_prod'] ?? ''));
-        $test = trim((string) ($config['url_test'] ?? ''));
-
-        if ($mode === 'prod' && $prod !== '') {
-            return $prod;
-        }
-        if ($mode === 'test' && $test !== '') {
-            return $test;
-        }
-        if ($prod !== '') {
-            return $prod;
-        }
-        if ($test !== '') {
-            return $test;
+        $key = match ($mode) {
+            'prod' => 'url_prod',
+            'test' => 'url_test',
+            default => throw new Exception('Modo de Guatefacturas inválido. Usa test o prod.'),
+        };
+        $url = trim((string) ($config[$key] ?? ''));
+        if ($url === '') {
+            throw new Exception("No se configuró {$key} de Guatefacturas para el modo {$mode}.");
         }
 
-        throw new Exception('No se configuró URL de Guatefacturas.');
+        if (filter_var($url, FILTER_VALIDATE_URL) === false
+            || !in_array(strtolower((string) parse_url($url, PHP_URL_SCHEME)), ['http', 'https'], true)) {
+            throw new Exception("La URL {$key} de Guatefacturas debe ser una dirección HTTP o HTTPS válida.");
+        }
+
+        return $url;
     }
 }

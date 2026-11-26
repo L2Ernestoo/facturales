@@ -62,30 +62,29 @@ class FelManager
 
     public function issue(FelDocumentData $data): array
     {
-        $usage = $this->monthlyUsage($data->company->id);
-        if ($usage['limit'] !== null && $usage['used'] >= $usage['limit']) {
-            return [
-                'success' => false,
-                'blocked' => true,
-                'error' => 'Se alcanzó el límite mensual de DTE configurado.',
-                'usage' => $usage,
-            ];
-        }
+        $reservation = DB::transaction(function () use ($data) {
+            // Serializa la búsqueda y creación sin mantener el lock durante el SOAP.
+            FelCompany::query()->whereKey($data->company->id)->lockForUpdate()->firstOrFail();
+            $existing = $this->findExistingIssue($data);
+            if ($existing) {
+                return $this->existingIssueResult($existing);
+            }
 
-        $totalMismatch = $this->totalMismatch($data);
-        if ($totalMismatch !== null && config('fel.strict_totals', false)) {
-            return [
-                'success' => false,
-                'blocked' => true,
-                'error' => sprintf(
-                    'El total enviado (%.2f) no coincide con la suma de los items (%.2f).',
-                    $totalMismatch['declared'],
-                    $totalMismatch['items']
-                ),
-            ];
-        }
+            $usage = $this->monthlyUsage($data->company->id);
+            if ($usage['limit'] !== null && $usage['used'] >= $usage['limit']) {
+                return [
+                    'success' => false,
+                    'blocked' => true,
+                    'error' => 'Se alcanzó el límite mensual de DTE configurado.',
+                    'usage' => $usage,
+                ];
+            }
 
-        $document = DB::transaction(function () use ($data, $totalMismatch) {
+            $mismatch = $this->totalMismatch($data);
+            if ($mismatch !== null && config('fel.strict_totals', false)) {
+                return $this->strictTotalResult($mismatch);
+            }
+
             $document = FelDocument::query()->create([
                 'fel_company_id' => $data->company->id,
                 'fel_branch_setting_id' => $data->branch->id,
@@ -95,7 +94,8 @@ class FelManager
                 ...$this->documentAttributes($data),
                 'metadata' => array_filter([
                     'options' => $data->options,
-                    'total_mismatch' => $totalMismatch,
+                    'certification_in_progress' => true,
+                    'total_mismatch' => $mismatch,
                 ], fn ($value) => $value !== null),
             ]);
 
@@ -104,112 +104,239 @@ class FelManager
             }
 
             return $document;
-        });
+        }, 3);
 
-        return $this->certify($document, $data, false);
+        return $reservation instanceof FelDocument ? $this->sendCertification($reservation, $data) : $reservation;
     }
 
     public function certifyExisting(FelDocument $document, FelDocumentData $data): array
     {
-        return $this->certify($document, $data, true);
+        return $this->withDocumentLock($document, 'certify', function () use ($document, $data) {
+            $reservation = DB::transaction(function () use ($document, $data) {
+                FelCompany::query()->whereKey($document->fel_company_id)->lockForUpdate()->firstOrFail();
+                $document = FelDocument::query()->lockForUpdate()->findOrFail($document->getKey());
+
+                if ((int) $document->fel_company_id !== $data->company->id
+                    || $document->source_type !== $data->sourceType
+                    || $document->source_id !== (string) $data->sourceId
+                    || strtoupper(trim($document->document_type)) !== $this->documentType($data)) {
+                    return [
+                        'success' => false,
+                        'blocked' => true,
+                        'document' => $document->load('items'),
+                        'error' => 'El reintento debe conservar la empresa, el origen y el tipo del DTE.',
+                        'debug' => [],
+                    ];
+                }
+
+                if ($document->status !== FelDocument::STATUS_ERROR || $this->requiresCertificationReview($document)) {
+                    return $this->existingIssueResult($document);
+                }
+
+                $other = $this->findExistingIssue($data, $document->getKey());
+                if ($other) {
+                    return $this->existingIssueResult($other);
+                }
+
+                $mismatch = $this->totalMismatch($data);
+                if ($mismatch !== null && config('fel.strict_totals', false)) {
+                    return $this->strictTotalResult($mismatch, $document);
+                }
+
+                $this->syncDocument($document, $data, $mismatch);
+
+                return $document;
+            }, 3);
+
+            return $reservation instanceof FelDocument ? $this->sendCertification($reservation, $data) : $reservation;
+        }, 'El DTE ya se está certificando en otro proceso. Espera unos segundos y revisa su estado.');
     }
 
-    private function certify(FelDocument $document, FelDocumentData $data, bool $syncSnapshot): array
+    private function findExistingIssue(FelDocumentData $data, ?int $excludeId = null): ?FelDocument
     {
-        $document->refresh();
+        $query = FelDocument::query()
+            ->where('fel_company_id', $data->company->id)
+            ->where('source_type', $data->sourceType)
+            ->where('source_id', (string) $data->sourceId)
+            ->whereRaw('UPPER(TRIM(document_type)) = ?', [$this->documentType($data)])
+            ->where('status', '!=', FelDocument::STATUS_ANNULLED)
+            ->orderByRaw('CASE WHEN status = ? THEN 0 WHEN status = ? THEN 1 ELSE 2 END', [
+                FelDocument::STATUS_CERTIFIED,
+                FelDocument::STATUS_PENDING,
+            ])
+            ->orderByDesc('id')
+            ->lockForUpdate();
 
-        // Un DTE certificado no se vuelve a enviar: el certificador emitiría otro.
-        if ($document->status === FelDocument::STATUS_CERTIFIED) {
+        if ($excludeId === null) {
+            return $query->first();
+        }
+
+        return $query->whereKeyNot($excludeId)->get()->first(
+            fn (FelDocument $candidate) => $candidate->status === FelDocument::STATUS_CERTIFIED
+                || $this->requiresCertificationReview($candidate)
+        );
+    }
+
+    private function documentType(FelDocumentData $data): string
+    {
+        return strtoupper(trim($data->documentType));
+    }
+
+    private function requiresCertificationReview(FelDocument $document): bool
+    {
+        return $document->status === FelDocument::STATUS_PENDING
+            || !empty($document->metadata['certification_uncertain'])
+            || !empty($document->metadata['certification_in_progress']);
+    }
+
+    private function existingIssueResult(FelDocument $document): array
+    {
+        if ($document->status === FelDocument::STATUS_CERTIFIED && filled($document->fel_uuid)) {
             return $this->alreadyCertifiedResult($document);
         }
-        if ($document->status === FelDocument::STATUS_ANNULLED) {
+
+        $uncertain = $document->status === FelDocument::STATUS_CERTIFIED || $this->requiresCertificationReview($document);
+
+        return [
+            'success' => false,
+            'blocked' => true,
+            'uncertain' => $uncertain,
+            'document' => $document->load('items'),
+            'error' => match (true) {
+                $uncertain => 'Hay un intento de certificación sin confirmar. Verifica el estado del DTE en el certificador antes de reintentar.',
+                $document->status === FelDocument::STATUS_ANNULLED => 'El DTE fue anulado; emite un documento nuevo en lugar de reintentar.',
+                default => 'Ya existe un DTE para esta operación. Usá certifyExisting() para reintentar el documento con error.',
+            },
+            'debug' => [],
+        ];
+    }
+
+    private function strictTotalResult(array $mismatch, ?FelDocument $document = null): array
+    {
+        return [
+            'success' => false,
+            'blocked' => true,
+            ...($document ? ['document' => $document->load('items'), 'debug' => []] : []),
+            'error' => sprintf(
+                'El total enviado (%.2f) no coincide con la suma de los items (%.2f).',
+                $mismatch['declared'],
+                $mismatch['items']
+            ),
+        ];
+    }
+
+    private function sendCertification(FelDocument $document, FelDocumentData $data): array
+    {
+        $result = $this->certifierFor($document->company)->certify($data, $document);
+        $document->refresh();
+        $metadata = $document->metadata ?: [];
+        unset($metadata['certification_in_progress']);
+
+        if (($result['success'] ?? false) === true && $document->status === FelDocument::STATUS_CERTIFIED
+            && filled($document->fel_uuid)) {
+            unset($metadata['certification_uncertain']);
+            $document->update(['metadata' => $metadata]);
+
             return [
-                'success' => false,
-                'document' => $document->fresh(['items']),
-                'error' => 'El DTE fue anulado; emite un documento nuevo en lugar de reintentar.',
-                'debug' => [],
+                'success' => true,
+                'document' => $document->load('items'),
+                'data' => $result['data'] ?? [],
             ];
         }
 
-        return $this->withDocumentLock($document, 'certify', function () use ($document, $data, $syncSnapshot) {
-            // Otro proceso pudo certificarlo mientras esperábamos.
-            $document->refresh();
-            if ($document->status === FelDocument::STATUS_CERTIFIED) {
-                return $this->alreadyCertifiedResult($document);
-            }
+        $uncertain = (bool) ($result['uncertain'] ?? false)
+            || ($result['success'] ?? false) === true
+            || $document->status === FelDocument::STATUS_CERTIFIED;
+        $error = $result['error'] ?? 'No se pudo confirmar la certificación del DTE.';
+        if ($uncertain) {
+            $metadata['certification_uncertain'] = true;
+        }
 
-            if ($syncSnapshot) {
-                $this->syncDocument($document, $data);
-            }
+        $document->update([
+            'status' => FelDocument::STATUS_ERROR,
+            'metadata' => $metadata,
+            'error_message' => $error,
+        ]);
 
-            $result = $this->certifierFor($document->company)->certify($data, $document);
-
-            if (($result['success'] ?? false) === true) {
-                return [
-                    'success' => true,
-                    'document' => $document->fresh(['items']),
-                    'data' => $result['data'] ?? [],
-                ];
-            }
-
-            return [
-                'success' => false,
-                'document' => $document->fresh(['items']),
-                'error' => $result['error'] ?? 'No se pudo certificar el DTE.',
-                'uncertain' => (bool) ($result['uncertain'] ?? false),
-                'debug' => $result['debug'] ?? [],
-            ];
-        }, 'El DTE ya se está certificando en otro proceso. Espera unos segundos y revisa su estado.');
+        return [
+            'success' => false,
+            'document' => $document->load('items'),
+            'error' => $error,
+            'uncertain' => $uncertain,
+            'debug' => $result['debug'] ?? [],
+        ];
     }
 
     public function annul(FelDocument $document, string $reason, array $context = []): array
     {
-        $document->refresh();
-
-        $precondition = match (true) {
-            $document->status === FelDocument::STATUS_ANNULLED => 'El DTE ya fue anulado.',
-            $document->status !== FelDocument::STATUS_CERTIFIED => 'Solo se pueden anular DTE certificados.',
-            blank($document->fel_serie) || blank($document->fel_preimpreso) => 'El DTE no tiene serie y preimpreso para anularlo.',
-            default => null,
-        };
-        if ($precondition !== null) {
-            return ['success' => false, 'annulment' => null, 'error' => $precondition];
-        }
-
         return $this->withDocumentLock($document, 'annul', function () use ($document, $reason, $context) {
-            $document->refresh();
-            if ($document->status === FelDocument::STATUS_ANNULLED) {
-                return ['success' => false, 'annulment' => null, 'error' => 'El DTE ya fue anulado.'];
+            $reservation = DB::transaction(function () use ($document, $reason, $context) {
+                $document = FelDocument::query()->lockForUpdate()->findOrFail($document->getKey());
+                $precondition = match (true) {
+                    $document->status === FelDocument::STATUS_ANNULLED => 'El DTE ya fue anulado.',
+                    $document->status !== FelDocument::STATUS_CERTIFIED => 'Solo se pueden anular DTE certificados.',
+                    blank($document->fel_serie) || blank($document->fel_preimpreso) => 'El DTE no tiene serie y preimpreso para anularlo.',
+                    default => null,
+                };
+                if ($precondition !== null) {
+                    return ['success' => false, 'annulment' => null, 'error' => $precondition];
+                }
+
+                $previous = FelAnnulment::query()->where('fel_document_id', $document->id)
+                    ->whereIn('status', ['PENDING', 'UNCERTAIN'])
+                    ->latest('id')
+                    ->first();
+                if ($previous) {
+                    return [
+                        'success' => false,
+                        'blocked' => true,
+                        'uncertain' => true,
+                        'annulment' => $previous,
+                        'error' => 'Hay una anulación sin confirmar. Verifica el estado del DTE en el certificador antes de reintentar.',
+                    ];
+                }
+
+                return FelAnnulment::query()->create([
+                    'fel_document_id' => $document->id,
+                    'reason' => $reason,
+                    'status' => 'PENDING',
+                    'user_id' => $context['user_id'] ?? null,
+                ]);
+            }, 3);
+
+            if (!$reservation instanceof FelAnnulment) {
+                return $reservation;
             }
 
-            $annulment = FelAnnulment::query()->create([
-                'fel_document_id' => $document->id,
-                'reason' => $reason,
-                'status' => 'PENDING',
-                'user_id' => $context['user_id'] ?? null,
-            ]);
-
+            $document->refresh();
             $result = $this->certifierFor($document->company)->annul($document, $reason, $context);
 
             if (($result['success'] ?? false) === true) {
-                $annulment->update([
-                    'status' => 'ANNULLED',
-                    'annulled_at' => Carbon::now(config('fel.timezone', 'America/Guatemala')),
-                    'response_body' => $result['data']['raw_response'] ?? json_encode($result['data'] ?? []),
-                ]);
+                DB::transaction(function () use ($reservation, $document, $result) {
+                    $document->update(['status' => FelDocument::STATUS_ANNULLED]);
+                    $reservation->update([
+                        'status' => 'ANNULLED',
+                        'annulled_at' => Carbon::now(config('fel.timezone', 'America/Guatemala')),
+                        'response_body' => $result['data']['raw_response'] ?? json_encode($result['data'] ?? []),
+                    ]);
+                });
 
-                $document->update(['status' => FelDocument::STATUS_ANNULLED]);
-
-                return ['success' => true, 'annulment' => $annulment->fresh(), 'data' => $result['data'] ?? []];
+                return ['success' => true, 'annulment' => $reservation->fresh(), 'data' => $result['data'] ?? []];
             }
 
-            $annulment->update([
-                'status' => 'ERROR',
+            $uncertain = (bool) ($result['uncertain'] ?? false);
+            $reservation->update([
+                'status' => $uncertain ? 'UNCERTAIN' : 'ERROR',
                 'error_message' => $result['error'] ?? 'No se pudo anular el DTE.',
                 'response_body' => $result['data']['raw_response'] ?? null,
             ]);
 
-            return ['success' => false, 'annulment' => $annulment->fresh(), 'error' => $annulment->error_message];
+            return [
+                'success' => false,
+                'annulment' => $reservation->fresh(),
+                'uncertain' => $uncertain,
+                'error' => $reservation->error_message,
+            ];
         }, 'El DTE ya se está anulando en otro proceso. Espera unos segundos y revisa su estado.');
     }
 
@@ -251,34 +378,35 @@ class FelManager
      * El snapshot guardado debe reflejar lo que realmente se envía al
      * certificador, también cuando se reintenta con datos corregidos.
      */
-    private function syncDocument(FelDocument $document, FelDocumentData $data): void
+    private function syncDocument(FelDocument $document, FelDocumentData $data, ?array $mismatch): void
     {
-        DB::transaction(function () use ($document, $data) {
-            $metadata = $document->metadata ?: [];
-            $metadata['options'] = $data->options;
-            unset($metadata['total_mismatch']);
+        $metadata = $document->metadata ?: [];
+        $metadata['options'] = $data->options;
+        $metadata['certification_in_progress'] = true;
+        unset($metadata['total_mismatch']);
 
-            $mismatch = $this->totalMismatch($data);
-            if ($mismatch !== null) {
-                $metadata['total_mismatch'] = $mismatch;
-            }
+        if ($mismatch !== null) {
+            $metadata['total_mismatch'] = $mismatch;
+        }
 
-            $document->update([
-                ...$this->documentAttributes($data),
-                'metadata' => $metadata,
-            ]);
+        $document->update([
+            ...$this->documentAttributes($data),
+            'fel_branch_setting_id' => $data->branch->id,
+            'metadata' => $metadata,
+            'status' => FelDocument::STATUS_PENDING,
+            'error_message' => null,
+        ]);
 
-            $document->items()->delete();
-            foreach ($data->items as $item) {
-                $document->items()->create($this->itemAttributes($item));
-            }
-        });
+        $document->items()->delete();
+        foreach ($data->items as $item) {
+            $document->items()->create($this->itemAttributes($item));
+        }
     }
 
     private function documentAttributes(FelDocumentData $data): array
     {
         return [
-            'document_type' => $data->documentType,
+            'document_type' => $this->documentType($data),
             'reference' => $data->reference,
             'buyer_nit' => $data->receiver->nit,
             'buyer_name' => $data->receiver->name,
@@ -308,7 +436,7 @@ class FelManager
      */
     private function totalMismatch(FelDocumentData $data): ?array
     {
-        if (strtoupper($data->documentType) === 'FESP') {
+        if ($this->documentType($data) === 'FESP') {
             return null;
         }
 
@@ -318,7 +446,7 @@ class FelManager
         )), 2);
         $declared = round($data->total, 2);
 
-        if (abs($itemsTotal - $declared) <= 0.01) {
+        if (abs((int) round($itemsTotal * 100) - (int) round($declared * 100)) <= 1) {
             return null;
         }
 
@@ -334,8 +462,8 @@ class FelManager
 
     /**
      * Evita que dos peticiones simultáneas (doble clic, reintentos) certifiquen
-     * o anulen el mismo documento. Si el cache de la app no soporta locks, se
-     * continúa sin lock como en versiones anteriores.
+     * o anulen el mismo documento. La reserva en base de datos protege la
+     * operación si el cache no soporta locks o si el lock expira.
      */
     private function withDocumentLock(FelDocument $document, string $action, callable $callback, string $busyMessage): array
     {

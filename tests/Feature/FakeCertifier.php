@@ -14,6 +14,8 @@ class FakeCertifier implements CertifierInterface
 
     public bool $succeed = true;
 
+    public bool $uncertain = false;
+
     public function certify(FelDocumentData $data, FelDocument $document): array
     {
         $this->certifyCalls++;
@@ -21,7 +23,7 @@ class FakeCertifier implements CertifierInterface
         if (!$this->succeed) {
             $document->update(['status' => FelDocument::STATUS_ERROR, 'error_message' => 'Falla simulada']);
 
-            return ['success' => false, 'error' => 'Falla simulada'];
+            return ['success' => false, 'error' => 'Falla simulada', 'uncertain' => $this->uncertain];
         }
 
         $document->update([
@@ -41,6 +43,6 @@ class FakeCertifier implements CertifierInterface
 
         return $this->succeed
             ? ['success' => true, 'data' => ['raw_response' => '<ok/>']]
-            : ['success' => false, 'error' => 'Anulación rechazada'];
+            : ['success' => false, 'error' => 'Anulación rechazada', 'uncertain' => $this->uncertain];
     }
 }
