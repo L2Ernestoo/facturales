@@ -354,6 +354,10 @@ Implementa `CertifierInterface` y registralo en `config/fel.php`:
 
 Luego configura la empresa con `certifier = otro`.
 
+## Referencia técnica de Ainnova
+
+Consulta la [matriz de compatibilidad FEL](docs/ainnova-fel.md) para ver el contrato SOAP, los XSD, las diferencias con el paquete y el índice de manuales.
+
 ## Ejecutar pruebas
 
 ```bash
