@@ -360,13 +360,19 @@ XML;
             return ['error' => 'El XML de respuesta del certificador es inválido.', 'uncertain' => true];
         }
 
-        $error = trim((string) ($xml->ERROR ?? $xml->Error ?? ''));
         $message = trim((string) ($xml->RESULTADO ?? $xml->Resultado ?? ($xml ? (string) $xml : $content)));
-        if ($error !== '' || preg_match('/^(?:ERROR|RECHAZAD[OA]|RECHAZO)\b/iu', $message) === 1) {
-            return ['error' => $error !== '' ? $error : $message];
-        }
 
         return ['message' => $message, 'xml' => $xml];
+    }
+
+    private function rejectionMessage(?SimpleXMLElement $xml, string $message): ?string
+    {
+        $error = trim((string) ($xml->ERROR ?? $xml->Error ?? ''));
+        if ($error !== '') {
+            return $error;
+        }
+
+        return preg_match('/^(?:ERROR|RECHAZAD[OA]|RECHAZO)\b/iu', $message) === 1 ? $message : null;
     }
 
     private function parseGenerateSoapResponse(string $soapResponse): array
@@ -377,6 +383,16 @@ XML;
         }
 
         $xml = $result['xml'];
+        $message = $result['message'];
+        $rejection = $this->rejectionMessage($xml, $message);
+        if ($rejection !== null) {
+            return ['error' => $rejection];
+        }
+        if (($xml === null || (strcasecmp($xml->getName(), 'Resultado') === 0 && count($xml->children()) === 0))
+            && preg_match('/\AUsuario\s+no\s+tiene\s+derechos\s+al\s+EMISOR\.?\z/iu', $message) === 1) {
+            return ['error' => $message];
+        }
+
         $uuid = trim((string) ($xml->NumeroAutorizacion ?? ''));
         $serie = trim((string) ($xml->Serie ?? ''));
         $preimpreso = trim((string) ($xml->Preimpreso ?? ''));
@@ -415,12 +431,29 @@ XML;
 
         $xml = $result['xml'];
         $message = $result['message'];
+        $serie = trim((string) ($xml->SERIE ?? $xml->Serie ?? ''));
+        $preimpreso = trim((string) ($xml->PREIMPRESO ?? $xml->Preimpreso ?? ''));
+        $rejection = $this->rejectionMessage($xml, $message);
 
-        // Se requiere una confirmación afirmativa explícita del proveedor.
-        $success = preg_match(
-            '/^(?:OK|ÉXITO|EXITOS[OA]|ANULADO|ANULACI[ÓO]N (?:EXITOSA|CORRECTA|REALIZADA CORRECTAMENTE)|(?:EL )?DOCUMENTO (?:HA SIDO )?ANULADO(?: CORRECTAMENTE| EXITOSAMENTE| CON [ÉE]XITO)?)[.!]?$/iu',
-            $message
-        ) === 1;
+        if ($xml !== null && strcasecmp($xml->getName(), 'RESULTADO') === 0 && isset($xml->ESTADO)) {
+            // La guía de Ainnova devuelve un estado y los identificadores del DTE.
+            $estado = trim((string) $xml->ESTADO);
+            $success = strcasecmp($estado, 'ANULADO') === 0
+                && $rejection === null && $message === ''
+                && count($xml->ESTADO) === 1
+                && count($xml->SERIE) === 1 && $serie !== ''
+                && count($xml->PREIMPRESO) === 1 && $preimpreso !== '';
+            $message = $estado;
+        } else {
+            if ($rejection !== null) {
+                return ['success' => false, 'error' => $rejection];
+            }
+
+            $success = preg_match(
+                '/^(?:OK|ÉXITO|EXITOS[OA]|ANULADO|ANULACI[ÓO]N (?:EXITOSA|CORRECTA|REALIZADA CORRECTAMENTE)|(?:EL )?DOCUMENTO (?:HA SIDO )?ANULADO(?: CORRECTAMENTE| EXITOSAMENTE| CON [ÉE]XITO)?)[.!]?$/iu',
+                $message
+            ) === 1;
+        }
         if (!$success) {
             return [
                 'success' => false,
@@ -432,8 +465,8 @@ XML;
         return [
             'success' => true,
             'message' => $message,
-            'serie' => trim((string) ($xml->SERIE ?? $xml->Serie ?? '')),
-            'preimpreso' => trim((string) ($xml->PREIMPRESO ?? $xml->Preimpreso ?? '')),
+            'serie' => $serie,
+            'preimpreso' => $preimpreso,
         ];
     }
 

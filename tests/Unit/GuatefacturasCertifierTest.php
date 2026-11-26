@@ -45,6 +45,30 @@ class GuatefacturasCertifierTest extends TestCase
         ];
     }
 
+    public function test_generate_response_recognizes_the_documented_permission_rejection(): void
+    {
+        $reason = "Usuario no tiene derechos al\nEMISOR";
+        $soap = $this->soap("<Resultado>{$reason}</Resultado>", 'generaDocumento', 'nested');
+
+        $parsed = $this->invokeCertifier('parseGenerateSoapResponse', $soap);
+
+        $this->assertSame(['error' => $reason], $parsed);
+    }
+
+    #[DataProvider('structuredAnnulmentFormats')]
+    public function test_annulment_accepts_the_documented_structured_confirmation(string $format): void
+    {
+        $result = '<RESULTADO><ESTADO>ANULADO</ESTADO><EMISOR>101</EMISOR><COMPRADOR>202</COMPRADOR><SERIE>A1</SERIE><PREIMPRESO>100</PREIMPRESO></RESULTADO>';
+        $parsed = $this->invokeCertifier('parseAnnulSoapResponse', $this->soap($result, 'anulaDocumento', $format));
+
+        $this->assertSame(['success' => true, 'message' => 'ANULADO', 'serie' => 'A1', 'preimpreso' => '100'], $parsed);
+    }
+
+    public static function structuredAnnulmentFormats(): array
+    {
+        return [['escaped'], ['nested'], ['cdata']];
+    }
+
     public function test_annulment_accepts_an_explicit_confirmation(): void
     {
         $result = '<Respuesta><RESULTADO>Documento anulado correctamente.</RESULTADO><SERIE>A1</SERIE><PREIMPRESO>100</PREIMPRESO></Respuesta>';
@@ -71,6 +95,11 @@ class GuatefacturasCertifierTest extends TestCase
             'unknown XML' => ['<Respuesta><SERIE>A1</SERIE></Respuesta>'],
             'still processing' => ['Procesando'],
             'negative text with the success phrase' => ['Documento no ha sido anulado correctamente.'],
+            'success status without preprinted number' => ['<RESULTADO><ESTADO>ANULADO</ESTADO><SERIE>A1</SERIE></RESULTADO>'],
+            'unknown status with positive text' => ['<RESULTADO>OK<ESTADO>PENDIENTE</ESTADO><SERIE>A1</SERIE><PREIMPRESO>100</PREIMPRESO></RESULTADO>'],
+            'success status with error' => ['<RESULTADO><ESTADO>ANULADO</ESTADO><ERROR>Solicitud rechazada</ERROR><SERIE>A1</SERIE><PREIMPRESO>100</PREIMPRESO></RESULTADO>'],
+            'contradictory statuses' => ['<RESULTADO><ESTADO>ANULADO</ESTADO><ESTADO>PENDIENTE</ESTADO><SERIE>A1</SERIE><PREIMPRESO>100</PREIMPRESO></RESULTADO>'],
+            'repeated series with different values' => ['<RESULTADO><ESTADO>ANULADO</ESTADO><SERIE>A1</SERIE><SERIE>B2</SERIE><PREIMPRESO>100</PREIMPRESO></RESULTADO>'],
         ];
     }
 
@@ -132,13 +161,17 @@ class GuatefacturasCertifierTest extends TestCase
         return (new ReflectionMethod($certifier, $name))->invoke($certifier, $argument);
     }
 
-    private function soap(string $content, string $operation = 'generaDocumento'): string
+    private function soap(string $content, string $operation = 'generaDocumento', string $format = 'escaped'): string
     {
-        $escaped = htmlspecialchars($content, ENT_XML1 | ENT_QUOTES, 'UTF-8');
+        $result = match ($format) {
+            'nested' => $content,
+            'cdata' => "<![CDATA[{$content}]]>",
+            'escaped' => htmlspecialchars($content, ENT_XML1 | ENT_QUOTES, 'UTF-8'),
+        };
 
         return <<<XML
         <env:Envelope xmlns:env="http://schemas.xmlsoap.org/soap/envelope/">
-            <env:Body><{$operation}Response><return>{$escaped}</return></{$operation}Response></env:Body>
+            <env:Body><{$operation}Response><return>{$result}</return></{$operation}Response></env:Body>
         </env:Envelope>
         XML;
     }

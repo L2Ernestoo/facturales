@@ -8,6 +8,7 @@
 - La reserva de cada operación se guarda antes de llamar al certificador. `certifyExisting()` exige conservar empresa, origen y tipo del DTE, y aplica `strict_totals` antes de actualizar el documento y sus ítems.
 - La integración con Guatefacturas exige UUID con formato válido, serie y preimpreso para certificar, y una confirmación afirmativa explícita para anular. Si la anulación devuelve serie o preimpreso, debe coincidir con el DTE enviado.
 - Una respuesta ambigua, un timeout o un intento interrumpido requieren conciliación antes de reenviar. Una anulación incierta queda en `fel_annulments.status = UNCERTAIN`, y el DTE conserva su estado `CERTIFIED` hasta confirmar el resultado.
+- Se reconoce la confirmación estructurada de Ainnova con `RESULTADO/ESTADO = ANULADO`, serie y preimpreso. El rechazo documentado por falta de permisos se clasifica como error confirmado. Los intentos históricos conservan sus estados hasta que se concilien con el portal.
 
 ### Actualización en producción
 
